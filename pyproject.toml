@@ -1,0 +1,6 @@
+[project]
+name = "archetypeai-fine-tuning-examples-omega"
+version = "0.1.0"
+description = "End-to-end Omega fine-tuning example on the Archetype AI platform (TEP fault detection)"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.31"]
