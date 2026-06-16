@@ -13,7 +13,7 @@ synthetic integer index — the inference reader treats the timestamp column as 
 opaque string, so a genuine date carries through cleanly.
 
 Four disjoint splits are carved from the same distribution, all z-scored using
-normal-operation statistics:
+statistics computed across normal + attack records (matching batch-examples-swat):
   - nshot : few-shot KNN reference (n_shots) for baseline + grid search
   - train : fine-tune training set
   - tune  : fine-tune validation set    + KNN grid-search scoring (model selection)
@@ -179,7 +179,7 @@ def main() -> None:
     print(f"Reading {total} Attack rows from {ATTACK_FILE} ...")
     a_ts, a_rows = read_class(args.source_dir / ATTACK_FILE, "attack", total)
 
-    mu, sd = zscore_stats(n_rows)  # normal-operation statistics
+    mu, sd = zscore_stats(n_rows + a_rows)  # statistics across normal + attack records
 
     print("Writing splits (real SWaT timestamps preserved):")
     offset = 0

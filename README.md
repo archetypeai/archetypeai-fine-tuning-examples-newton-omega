@@ -99,8 +99,10 @@ uv sync                        # or: python3 -m venv .venv && .venv/bin/pip inst
 prep steps:
 
 - **Contiguous shots** — each split is a contiguous slice of the timeline (not shuffled).
-- **Z-scoring** — channels are standardized using normal-operation statistics, so an
-  attack shows up as a deviation from normal.
+- **Z-scoring** — channels are standardized using statistics computed across all records
+  (normal + attack), matching `batch-examples-swat`. This keeps every channel on one
+  consistent scale and avoids extreme values (normal-only stats would blow attack
+  readings up to ~500σ).
 - **Imputation** — missing/invalid sensor readings are forward-filled from the last
   valid value (the standard fix for sensor dropouts).
 
@@ -137,11 +139,11 @@ On the held-out `eval` set (balanced, ~54.5k windows), Omega 1.5:
 
 | Model | Accuracy | Macro-F1 | Behavior |
 |---|---|---|---|
-| **Baseline** (tuned few-shot KNN, w128/k15/cosine) | **76.9%** | **0.767** | catches 85.5% of attacks; some false alarms on normal |
+| **Baseline** (tuned few-shot KNN, w128/k15/cosine) | **79.7%** | **0.796** | catches 87.6% of attacks; some false alarms on normal |
 | **Fine-tuned** (Omega head) | 50.0% | 0.333 | **collapsed — predicts `attack` for everything** |
 
-So on this run the fine-tuned head **loses to the baseline by ~27 points**. This is
-*not* a result about Omega embeddings or the task — tuned KNN reaches 0.767 on the very
+So on this run the fine-tuned head **loses to the baseline by ~30 points**. This is
+*not* a result about Omega embeddings or the task — tuned KNN reaches 0.796 on the very
 same embeddings, so the signal is clearly there. It's a training failure in the
 fine-tune worker; see below.
 
@@ -159,9 +161,11 @@ balanced binary set. What's happening:
   for this head: the logits saturate on the first pass, gradients vanish, and the model
   is stuck. None of these knobs are exposed in the job config (only `batch_size`,
   `epochs`, and the window are).
-- The collapse reproduced **identically on two unrelated datasets** (TEP and SWaT),
-  while KNN on the same embeddings scores 0.67–0.77 — confirming an optimizer problem,
-  not a data or concept problem.
+- The collapse reproduced **identically across two unrelated datasets** (TEP and SWaT)
+  **and both normalization schemes** (normal-only z-scoring with 500σ extremes, and
+  global z-scoring with values capped near 16σ) — while KNN on the same embeddings
+  scores 0.67–0.80. That rules out the data, the task, and the input scale, leaving the
+  optimizer as the sole cause.
 
 **The fix is worker-side** (lower learning rate / add warmup + LR schedule / enable
 class balancing in `omega-fine-tune-job`) and is not addressable from this example
