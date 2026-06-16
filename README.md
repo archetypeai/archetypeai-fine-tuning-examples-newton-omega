@@ -1,4 +1,4 @@
-# Fine-Tuning Omega on Archetype AI — a worked example
+# Fine-Tuning Omega on Archetype AI — an end-to-end example
 
 This repository is a hands-on, end-to-end example of **fine-tuning an Omega 1.5
 classification head** on the Archetype AI platform, and measuring whether it
@@ -133,14 +133,40 @@ embeddings and the comparison isolates the classifier, not the window.
 
 ## Results
 
-Run step 7 to produce the comparison (macro-F1, preferred over accuracy on imbalanced
-data, plus a confusion matrix per model):
+On the held-out `eval` set (balanced, ~54.5k windows), Omega 1.5:
 
-```
-  Baseline accuracy:   <fill in>
-  Fine-tuned accuracy: <fill in>
-  Delta:               <fill in>
-```
+| Model | Accuracy | Macro-F1 | Behavior |
+|---|---|---|---|
+| **Baseline** (tuned few-shot KNN, w128/k15/cosine) | **76.9%** | **0.767** | catches 85.5% of attacks; some false alarms on normal |
+| **Fine-tuned** (Omega head) | 50.0% | 0.333 | **collapsed — predicts `attack` for everything** |
+
+So on this run the fine-tuned head **loses to the baseline by ~27 points**. This is
+*not* a result about Omega embeddings or the task — tuned KNN reaches 0.767 on the very
+same embeddings, so the signal is clearly there. It's a training failure in the
+fine-tune worker; see below.
+
+### Known limitation: the fine-tune head collapses
+
+Every fine-tune run produces only a single `step_1` checkpoint with validation
+macro-F1 ≈ 0.333 — exactly the score of predicting one class for everything on a
+balanced binary set. What's happening:
+
+- The worker saves a checkpoint **only when validation macro-F1 improves**. `step_1`
+  alone means validation peaked at epoch 1 and never improved across all 30 epochs —
+  the head collapsed to a single-class prediction immediately and never recovered.
+- The training engine uses **AdamW at a fixed `learning_rate = 1e-3`, no schedule, no
+  warmup, `balance_classes = False`**, on a transformer head. That LR is too aggressive
+  for this head: the logits saturate on the first pass, gradients vanish, and the model
+  is stuck. None of these knobs are exposed in the job config (only `batch_size`,
+  `epochs`, and the window are).
+- The collapse reproduced **identically on two unrelated datasets** (TEP and SWaT),
+  while KNN on the same embeddings scores 0.67–0.77 — confirming an optimizer problem,
+  not a data or concept problem.
+
+**The fix is worker-side** (lower learning rate / add warmup + LR schedule / enable
+class balancing in `omega-fine-tune-job`) and is not addressable from this example
+alone. Until then, this repo demonstrates the full pipeline end-to-end but does not yet
+show fine-tuning beating the baseline.
 
 ## How it works
 
@@ -151,6 +177,23 @@ data, plus a confusion matrix per model):
   classifies each eval window. With no checkpoint it uses few-shot KNN over the
   `n_shots` reference; attaching the fine-tuned checkpoint on the
   `fine_tune_checkpoint` port swaps in the trained head instead.
+
+### How the splits map to job inputs
+
+For the committed SWaT splits, the jobs resolve their inputs like this:
+
+- **Fine-tune** — window **128** (the KNN grid winner, reused so both classifiers see
+  identical embeddings), **10 inputs**: 8 `train` files (4 normal + 4 attack) on
+  `worker.train`, and 2 `tune` files (1 each) on `worker.test` (validation).
+- **Baseline** — KNN at the grid-winning config **w128 / k15 / cosine**, **14 inputs**:
+  2 `nshot` files (1 each) on `worker.n_shots` as the few-shot reference, and 12 `eval`
+  files (6 each) on `worker.inference` as the held-out set being classified.
+- **Fine-tuned inference** — the same 12 `eval` files, plus the trained checkpoint on
+  `worker.fine_tune_checkpoint` (and the `n_shots` reference, which is ignored once a
+  checkpoint is attached).
+
+(Input counts follow directly from the split sizes and `--rows-per-file`; window 128 is
+whatever the grid picks for the committed data.)
 
 ## Notes
 

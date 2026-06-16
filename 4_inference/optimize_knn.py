@@ -109,7 +109,8 @@ def submit(cfg: dict) -> str:
 
 
 def job_status(job_id: str) -> str:
-    return requests.get(f"{BASE_URL}/batch/jobs/{job_id}", headers=AUTH).json()["status"]
+    # Treat a missing/deleted job as terminal rather than crashing the poll loop.
+    return requests.get(f"{BASE_URL}/batch/jobs/{job_id}", headers=AUTH).json().get("status", "FAILED")
 
 
 def macro_f1(job_id: str) -> float:
