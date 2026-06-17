@@ -98,7 +98,7 @@ TEST_FILES = split_files("tune", with_metadata=True)
 JOB_PAYLOAD = {
     "name": "swat-omega-fine-tune",
     "pipeline_type": "training",
-    "pipeline_key": "omega-fine-tune-job",
+    "pipeline_key": "fine-tuning-omega",
     "inputs": {
         "worker.train_data": TRAIN_FILES,
         "worker.eval_data": TEST_FILES,
