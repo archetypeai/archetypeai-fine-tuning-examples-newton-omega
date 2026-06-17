@@ -100,8 +100,8 @@ JOB_PAYLOAD = {
     "pipeline_type": "training",
     "pipeline_key": "omega-fine-tune-job",
     "inputs": {
-        "worker.train": TRAIN_FILES,
-        "worker.test": TEST_FILES,
+        "worker.train_data": TRAIN_FILES,
+        "worker.eval_data": TEST_FILES,
     },
     "parameters": {
         "worker": {
