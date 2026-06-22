@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.10"
 
 [[package]]
-name = "archetypeai-fine-tuning-examples-omega"
+name = "archetypeai-fine-tuning-examples-newton-omega"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

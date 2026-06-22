@@ -1,6 +1,6 @@
 [project]
-name = "archetypeai-fine-tuning-examples-omega"
+name = "archetypeai-fine-tuning-examples-newton-omega"
 version = "0.1.0"
-description = "End-to-end Omega fine-tuning example on the Archetype AI platform (TEP fault detection)"
+description = "End-to-end Omega 1.5 head fine-tuning example on the Archetype AI platform (SWaT attack detection)"
 requires-python = ">=3.10"
 dependencies = ["requests>=2.31"]
