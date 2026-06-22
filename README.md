@@ -195,8 +195,8 @@ bug, not a data or task problem.
 For the committed SWaT splits, the jobs resolve their inputs like this:
 
 - **Fine-tune** — window **128** (the KNN grid winner, reused so both classifiers see
-  identical embeddings), **10 inputs**: 8 `train` files (4 normal + 4 attack) on
-  `worker.train`, and 2 `tune` files (1 each) on `worker.test` (validation).
+  identical embeddings), **10 inputs**: 8 `train` files (4 normal + 4 attack) as
+  `training_files`, and 2 `tune` files (1 each) as `validation_files`.
 - **Baseline** — KNN at the grid-winning config **w128 / k15 / cosine**, **14 inputs**:
   2 `nshot` files (1 each) on `worker.n_shots` as the few-shot reference, and 12 `eval`
   files (6 each) on `worker.inference` as the held-out set being classified.
@@ -206,6 +206,70 @@ For the committed SWaT splits, the jobs resolve their inputs like this:
 
 (Input counts follow directly from the split sizes and `--rows-per-file`; window 128 is
 whatever the grid picks for the committed data.)
+
+## Serving the fine-tuned model (how the "after" works)
+
+The fine-tune produces a **checkpoint** (`ckp_…`). To serve it, run the *same*
+`machine-state-classification` batch job as the baseline and attach the checkpoint on the
+**`worker.fine_tune_checkpoint` input port**. The worker then loads your trained head and
+classifies with it **instead of** building the few-shot KNN — same frozen Omega 1.5
+encoder underneath, different classifier on top. Full request:
+
+```json
+POST /v0.5/batch/jobs
+{
+  "name": "swat-machine-state-fine-tuned",
+  "pipeline_type": "batch",
+  "pipeline_key": "machine-state-classification",
+  "inputs": {
+    "worker.inference":            [ { "file_id": "swat_normal_eval_0_g.csv" }, ... ],
+    "worker.n_shots":              [ { "file_id": "swat_normal_nshot_0_g.csv", "metadata": {"class": "normal"} }, ... ],
+    "worker.fine_tune_checkpoint": [ { "kind": "checkpoint", "checkpoint_id": "ckp_5kn596dy9v8wztr2fcqyhvrsa0", "metadata": {} } ]
+  },
+  "parameters": {
+    "worker": {
+      "parallelism": 1,
+      "config": {
+        "model_type": "omega_1_5_base",
+        "omega_1_5": { "base_model_path": "s3://.../omega1.5_target_encoder.pt" },
+        "reader_config": { "window_size": 128, "step_size": 1, "timestamp_column": "timestamp", "data_columns": [ ... ] }
+      }
+    }
+  }
+}
+```
+
+The **only** difference from a baseline job is the added `worker.fine_tune_checkpoint`
+input — everything else (encoder, eval files, reader) is identical:
+
+```diff
+  "inputs": {
+    "worker.inference":            [ ... ],
+    "worker.n_shots":              [ ... ],
++   "worker.fine_tune_checkpoint": [ { "kind": "checkpoint", "checkpoint_id": "ckp_..." } ]
+  }
+```
+
+`4_inference/create_inference_job.py` builds this automatically: with no `--baseline` it
+reads `data/checkpoint_id.txt` (written by step 5) and attaches it on
+`worker.fine_tune_checkpoint`; override with a positional arg
+(`python 4_inference/create_inference_job.py <ckp_id>`).
+
+**Picking the checkpoint.** A fine-tune saves several checkpoints — one each time
+validation macro-F1 improves — so the **highest step is the best-validation one**.
+`create_fine_tune_job.py` keeps that and writes it to `data/checkpoint_id.txt`.
+
+> **⚠️ Two things that must match, or the "after" silently misleads you.**
+> - **Use the `worker.fine_tune_checkpoint` port**, not a `config` field. When a
+>   checkpoint is attached the worker ignores `classifier_config` and the `n_shots`
+>   reference (they're the KNN path); the head replaces them. Pass them anyway — the port
+>   is required — they're just inert.
+> - **`window_size` must equal the fine-tune's training window** (here 128, recorded in
+>   `data/finetune_window.txt`). The head only understands embeddings from the window it
+>   was trained on; a mismatch feeds it the wrong-shaped input and quietly tanks accuracy.
+>
+> Unlike the Newton/fusion path, there's no `fine_tuned_model` handle to reference — you
+> attach the `ckp_…` checkpoint id directly.
 
 ## Notes
 
