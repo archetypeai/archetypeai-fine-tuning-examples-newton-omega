@@ -35,12 +35,16 @@ AUTH = {"Authorization": f"Bearer {API_KEY}"}
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "subset")
 
 
-def initiate_upload(filename: str, file_size: int) -> dict:
+def initiate_upload(filename: str, file_size: int) -> dict | None:
     resp = requests.post(
         f"{BASE_URL}/files/uploads/initiate",
         headers={**AUTH, "Content-Type": "application/json"},
         json={"filename": filename, "file_type": "text/csv", "num_bytes": file_size},
     )
+    # 409 = a file with this id already exists (platform file_ids are immutable).
+    # Treat as "already uploaded" so re-runs are idempotent.
+    if resp.status_code == 409:
+        return None
     resp.raise_for_status()
     return resp.json()
 
@@ -82,6 +86,9 @@ def upload_file(file_path: str) -> None:
     print(f"  {filename} ({file_size / 1024:.0f} KB) ... ", end="", flush=True)
 
     init = initiate_upload(filename, file_size)
+    if init is None:
+        print("already uploaded, skipping")
+        return
     upload_id = init["upload_id"]
 
     completed_parts = []

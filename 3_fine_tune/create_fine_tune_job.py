@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
-Create and monitor an Omega fine-tuning job on the Archetype AI platform.
+Create and monitor an Omega head fine-tuning job via the canonical fine-tuning API.
 
 Fine-tunes a classification head on top of the frozen Omega 1.5 encoder using
-labeled SWaT CSV files (one class per file, declared via input metadata).
+labeled SWaT CSV files. Uses the OpenAI-style fine-tuning service (the same one
+the Console uses, and the Newton/"fusion" example uses):
+
+    POST /v0.6/fine_tuning/jobs            create the job  (model="omega")
+    GET  /v0.6/fine_tuning/jobs/{id}       status
+    GET  /v0.6/fine_tuning/jobs/{id}/events|checkpoints
+
+This produces an `ftj_...` job and `ckp_...` checkpoints; the platform backs the
+"omega"/"head" method onto the internal `fine-tuning-omega` pipeline. The resulting
+checkpoint id is written to data/checkpoint_id.txt for the inference step.
 
 Usage:
     python 3_fine_tune/create_fine_tune_job.py
-
-On success, the resulting checkpoint id is written to data/checkpoint_id.txt
-for the inference step to pick up.
 """
 
 import csv
+import glob
 import json
 import os
 import sys
@@ -29,211 +36,162 @@ with open(ENV_PATH) as f:
             os.environ.setdefault(k, v)
 
 API_KEY = os.environ["ATAI_API_KEY"]
-API_ENDPOINT = os.environ["ATAI_API_ENDPOINT"]
-BASE_URL = f"{API_ENDPOINT}/v0.5"
+API_ENDPOINT = os.environ["ATAI_API_ENDPOINT"].rstrip("/")
+FT = f"{API_ENDPOINT}/v0.6/fine_tuning"
 AUTH = {"Authorization": f"Bearer {API_KEY}"}
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
-
-# The Omega 1.5 encoder checkpoint resolved by the platform worker.
-OMEGA_15_BASE_MODEL_PATH = os.environ.get(
-    "OMEGA_15_BASE_MODEL_PATH",
-    "s3://atai-platform-dev-platform-data-us-west-2/model_checkpoints/omega_1_5/omega1.5_target_encoder.pt",
-)
-
-POLL_INTERVAL_SEC = 5
-TERMINAL_STATUSES = {"COMPLETED", "FAILED", "CANCELLED"}
-
-
-import glob
-import json
-
 SUBSET_DIR = os.path.join(DATA_DIR, "subset")
 CLASSES = ("normal", "attack")
 
-# Optional suffix on file_ids — must match FILE_SUFFIX used at upload time.
+# Must match FILE_SUFFIX used at upload time (platform file_ids are immutable).
 FILE_SUFFIX = os.environ.get("FILE_SUFFIX", "")
+# Optional reproducibility seed (Denis: omega results vary by seed; pin for repeatability).
+SEED = int(os.environ["OMEGA_FT_SEED"]) if os.environ.get("OMEGA_FT_SEED") else 42
+
+POLL_INTERVAL_SEC = 15
+# v0.6 uses SUCCEEDED; accept the JOS-style terminals too.
+TERMINAL = {"SUCCEEDED", "COMPLETED", "FAILED", "CANCELLED", "CANCELED", "STOPPED"}
+SUCCESS = {"SUCCEEDED", "COMPLETED"}
 
 
 def finetune_window() -> int:
-    """Train the head at the KNN grid's winning window, so the baseline and the
-    head see identical embeddings (a controlled comparison). Falls back to 32 if
-    the grid hasn't run yet."""
+    """Train at the KNN grid's winning window so the baseline and the head see
+    identical embeddings (controlled comparison). Falls back to 32."""
     path = os.path.join(DATA_DIR, "best_knn_config.json")
     if os.path.exists(path):
         with open(path) as f:
             return int(json.load(f)["window_size"])
-    print("  [note] no best_knn_config.json — run 4_inference/optimize_knn.py first;"
-          " defaulting head window to 32.")
+    print("  [note] no best_knn_config.json — run 4_inference/optimize_knn.py first; defaulting window to 32.")
     return 32
-
-
-FINETUNE_WINDOW = finetune_window()
 
 
 def get_data_columns() -> list:
     sample = sorted(glob.glob(os.path.join(SUBSET_DIR, "swat_*_nshot_0.csv")))[0]
     with open(sample) as f:
-        header = next(csv.reader(f))
-    return [c for c in header if c != "timestamp"]
+        return [c for c in next(csv.reader(f)) if c != "timestamp"]
 
 
-def split_files(split: str, with_metadata: bool) -> list:
-    """All file_ids for a split (e.g. 'train'), across both classes."""
-    files = []
+def omega_files(split: str) -> list:
+    """v0.6 Omega n-shot files for a split: one entry per file, class in `label`."""
+    out = []
     for cls in CLASSES:
         for path in sorted(glob.glob(os.path.join(SUBSET_DIR, f"swat_{cls}_{split}_*.csv"))):
             stem = os.path.basename(path)[:-len(".csv")]
-            file_id = f"{stem}{FILE_SUFFIX}.csv"
-            files.append({"file_id": file_id, "metadata": {"class": cls}} if with_metadata
-                         else {"file_id": file_id})
-    if not files:
+            out.append({"type": "n_shot", "file_id": f"{stem}{FILE_SUFFIX}.csv",
+                        "label": cls, "format": "csv"})
+    if not out:
         raise SystemExit(f"No swat_*_{split}_*.csv in {SUBSET_DIR}. Run 1_prepare_data/make_subset.py first.")
-    return files
+    return out
 
 
-# train split trains the head; tune split is the validation set.
-TRAIN_FILES = split_files("train", with_metadata=True)
-TEST_FILES = split_files("tune", with_metadata=True)
+FINETUNE_WINDOW = finetune_window()
+TRAIN_FILES = omega_files("train")   # labeled training set
+EVAL_FILES = omega_files("tune")     # labeled validation/test set (required for omega)
 
-JOB_PAYLOAD = {
-    "name": "swat-omega-fine-tune",
-    "pipeline_type": "training",
-    "pipeline_key": "fine-tuning-omega",
-    "inputs": {
-        "worker.train_data": TRAIN_FILES,
-        "worker.eval_data": TEST_FILES,
-    },
-    "parameters": {
-        "worker": {
-            "parallelism": 1,
-            "config": {
-                "model_type": "omega_1_5_base",
-                "omega_1_5": {"base_model_path": OMEGA_15_BASE_MODEL_PATH},
-                "reader_config": {
-                    # Train at the KNN grid's winning window so both classifiers
-                    # see identical embeddings. Fine-tuned inference must reuse
-                    # this same window (recorded to data/finetune_window.txt).
+
+def build_request() -> dict:
+    return {
+        "name": "swat-omega-fine-tune",
+        "seed": SEED,
+        "model": "omega",
+        "method": {
+            "type": "head",
+            "head": {
+                "hyperparameters": {"batch_size": 32, "n_epochs": 30},
+                "reader": {
                     "window_size": FINETUNE_WINDOW,
-                    # step 4 over the 30k-row/class train split => ~15k windows.
                     "step_size": 4,
                     "data_columns": get_data_columns(),
                 },
-                "batch_size": 32,
-                "data_source": {"source_type": "s3"},
-                "train_config": {"epochs": 30},
             },
-        }
-    },
-}
+        },
+        "training_files": TRAIN_FILES,
+        "validation_files": EVAL_FILES,
+    }
 
 
-def create_job(payload: dict) -> dict:
-    resp = requests.post(
-        f"{BASE_URL}/batch/jobs",
-        headers={**AUTH, "Content-Type": "application/json"},
-        json=payload,
-    )
-    if not resp.ok:
-        print(f"Job creation failed ({resp.status_code}): {resp.text}")
-        resp.raise_for_status()
-    return resp.json()
+def _get(path: str, params: dict | None = None, attempts: int = 6) -> dict:
+    last = None
+    for i in range(attempts):
+        try:
+            r = requests.get(f"{FT}{path}", headers=AUTH, params=params, timeout=30)
+            if r.status_code >= 500:
+                last = f"{r.status_code} {r.reason}"
+                time.sleep(min(5 * (i + 1), 30)); continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            last = str(e); time.sleep(min(5 * (i + 1), 30))
+    raise RuntimeError(f"GET {path} failed after {attempts} attempts: {last}")
 
 
-def get_job(job_id: str) -> dict:
-    resp = requests.get(f"{BASE_URL}/batch/jobs/{job_id}", headers=AUTH)
-    resp.raise_for_status()
-    return resp.json()
+def create_job(body: dict) -> dict:
+    r = requests.post(f"{FT}/jobs", headers={**AUTH, "Content-Type": "application/json"},
+                      json=body, timeout=60)
+    if not r.ok:
+        print(f"Job creation failed ({r.status_code}): {r.text}")
+        r.raise_for_status()
+    return r.json()
 
 
-def list_paginated(job_id: str, kind: str, offset: int) -> dict:
-    resp = requests.get(
-        f"{BASE_URL}/batch/jobs/{job_id}/{kind}",
-        headers=AUTH,
-        params={"offset": offset, "limit": 100},
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def watch_job(job_id: str) -> str:
+def watch(job_id: str) -> str:
     last_status = None
-    event_offset = 0
-    progress_offset = 0
-
+    seen: set[str] = set()
     print("\nWatching job progress ...")
     while True:
-        job = get_job(job_id)
-        status = job["status"]
+        job = _get(f"/jobs/{job_id}")
+        status = job.get("status")
         if status != last_status:
             print(f"[status] {status}")
             last_status = status
-
-        events = list_paginated(job_id, "events", event_offset).get("events", [])
-        for event in events:
-            print(f"[event][{event.get('level')}] {event.get('event_type')}: {event.get('message') or '-'}")
-        event_offset += len(events)
-
-        progress = list_paginated(job_id, "progress", progress_offset).get("entries", [])
-        for entry in progress:
-            print(f"[progress][{entry.get('kind')} step={entry.get('step')}] {entry.get('message') or '-'}")
-        progress_offset += len(progress)
-
-        if status in TERMINAL_STATUSES:
+        # events are newest-first; print unseen oldest-first
+        for e in reversed(_get(f"/jobs/{job_id}/events", {"limit": 100}).get("data", [])):
+            eid = e.get("id") or f"{e.get('created_at')}-{e.get('message')}"
+            if eid in seen:
+                continue
+            seen.add(eid)
+            print(f"  [event][{e.get('level','')}] {e.get('type') or e.get('event_type','')}: {e.get('message','')}")
+        if status in TERMINAL:
             return status
-
         time.sleep(POLL_INTERVAL_SEC)
-
-
-def list_checkpoints(job_id: str) -> list:
-    resp = requests.get(
-        f"{BASE_URL}/batch/jobs/{job_id}/checkpoints",
-        headers=AUTH,
-        params={"offset": 0, "limit": 100},
-    )
-    resp.raise_for_status()
-    return resp.json().get("checkpoints", [])
 
 
 def main() -> None:
     print("=" * 60)
-    print(f" Omega Fine-Tune Job (SWaT, {len(CLASSES)} classes: {', '.join(CLASSES)})")
+    print(f" Omega Head Fine-Tune via /v0.6/fine_tuning/jobs (SWaT: {', '.join(CLASSES)})")
     print("=" * 60)
-    print(f"  Endpoint: {BASE_URL}")
-    print(f"  Window:   {FINETUNE_WINDOW} (matched to KNN grid winner)")
+    print(f"  Endpoint: {FT}/jobs")
+    print(f"  Window:   {FINETUNE_WINDOW} (matched to KNN grid winner) | seed: {SEED}")
     print(f"  Train:    {[f['file_id'] for f in TRAIN_FILES]}")
-    print(f"  Test:     {[f['file_id'] for f in TEST_FILES]}")
+    print(f"  Val:      {[f['file_id'] for f in EVAL_FILES]}")
 
-    job = create_job(JOB_PAYLOAD)
+    job = create_job(build_request())
     job_id = job["id"]
-    print(f"  Job ID:   {job_id}")
-    print(f"  Status:   {job['status']}")
+    print(f"  Job ID:   {job_id}   (fine_tuned_model resolves on success)")
+    print(f"  Status:   {job.get('status')}")
 
-    status = watch_job(job_id)
+    status = watch(job_id)
     print(f"\nJob finished with status: {status}")
-    if status != "COMPLETED":
+    if status not in SUCCESS:
         sys.exit(1)
 
-    checkpoints = list_checkpoints(job_id)
+    checkpoints = _get(f"/jobs/{job_id}/checkpoints").get("data", [])
     if not checkpoints:
         print("No checkpoints were produced.")
         sys.exit(1)
 
     print("Checkpoints:")
-    for ckpt in checkpoints:
-        print(f"  - id={ckpt['id']} name={ckpt.get('name')} step={ckpt.get('step')}")
-        print(f"    metrics={json.dumps(ckpt.get('metrics'))}")
+    for c in sorted(checkpoints, key=lambda x: x.get("step", 0)):
+        print(f"  - id={c.get('id')} step={c.get('step')} metrics={json.dumps(c.get('metrics'))}")
 
-    # The job saves a checkpoint each time validation improves, so the highest
-    # step is the best-performing one. (The list is not guaranteed ordered.)
+    # Best = highest step (the worker saves on each validation improvement).
     best = max(checkpoints, key=lambda c: c.get("step", 0))
     checkpoint_id = best["id"]
-    ckpt_path = os.path.join(DATA_DIR, "checkpoint_id.txt")
-    with open(ckpt_path, "w") as f:
+    with open(os.path.join(DATA_DIR, "checkpoint_id.txt"), "w") as f:
         f.write(checkpoint_id)
-    # Record the training window so fine-tuned inference uses the same one.
     with open(os.path.join(DATA_DIR, "finetune_window.txt"), "w") as f:
         f.write(str(FINETUNE_WINDOW))
-    print(f"\nSaved checkpoint id to {ckpt_path}: {checkpoint_id}")
+    print(f"\nSaved checkpoint id: {checkpoint_id} (step {best.get('step')})")
     print(f"Trained at window {FINETUNE_WINDOW} (saved to data/finetune_window.txt)")
     print("Next: python 4_inference/create_inference_job.py")
 

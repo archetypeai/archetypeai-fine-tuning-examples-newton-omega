@@ -45,8 +45,8 @@ A few clarifications, since the terminology trips people up:
 - **The "head" is a small neural network** that maps an Omega embedding to a class
   score. It has its own learnable weights, trained on your labeled data.
 - **The Omega encoder stays frozen in both cases** — its weights never change. Only the
-  head learns. (The platform labels the job `omega-fine-tune-job`; the encoder itself
-  is not retrained, which is also why it's fast and cheap.)
+  head learns. (Fine-tuning runs through `model: "omega"` on the canonical FT API; the
+  encoder itself is not retrained, which is also why it's fast and cheap.)
 - **Why the head can beat KNN:** nearest-neighbour can only draw boundaries from raw
   distance in the frozen embedding space; a trained head can learn which embedding
   dimensions actually distinguish an attack, expressing boundaries KNN cannot.
@@ -174,13 +174,17 @@ show fine-tuning beating the baseline.
 
 ## How it works
 
-- **Fine-tune** (`pipeline_type: training`, `pipeline_key: omega-fine-tune-job`):
-  windows each labeled CSV, embeds the windows with the frozen Omega 1.5 encoder, and
-  trains a classification head, saving it as a platform checkpoint.
+- **Fine-tune** — via the canonical fine-tuning API `POST /v0.6/fine_tuning/jobs`
+  (`model: "omega"`, `method.type: "head"`), the same OpenAI-style service the Console
+  and the Newton example use. It produces an `ftj_…` job (visible on the Fine-Tuning
+  page); the worker windows each labeled CSV, embeds the windows with the frozen Omega
+  1.5 encoder, trains a classification head, and saves it as a `ckp_…` checkpoint.
+  (Under the hood the platform backs `model: "omega"` onto the internal
+  `fine-tuning-omega` pipeline.)
 - **Inference** (`pipeline_type: batch`, `pipeline_key: machine-state-classification`):
   classifies each eval window. With no checkpoint it uses few-shot KNN over the
-  `n_shots` reference; attaching the fine-tuned checkpoint on the
-  `fine_tune_checkpoint` port swaps in the trained head instead.
+  `n_shots` reference; attaching the fine-tuned `ckp_…` on the `fine_tune_checkpoint`
+  port swaps in the trained head instead.
 
 ### How the splits map to job inputs
 
@@ -209,22 +213,14 @@ whatever the grid picks for the committed data.)
 
 ## One-time pipeline registration (internal — remove before making this repo public)
 
-The `omega-fine-tune-job` and `machine-state-classification` pipelines must have a
-registered version in the Dev org, or job creation fails with
-`404 NOT_FOUND: Pipeline ... has no active versions`. Registration uses internal seed
-modules from `atai_core`:
+The `fine-tuning-omega` (fine-tune) and `machine-state-classification` (inference)
+pipelines must be deployed and resolvable in your Dev org, or job creation fails with
+`404 NOT_FOUND: Pipeline ... not found`. Both are now platform-deployed with published
+versions that have the needed ports, so the scripts **auto-resolve** them — no manual
+seeding or version pinning required.
 
-```bash
-cd <atai_core>/jobs/machine_state_job && uv sync
-cp env_settings/register_omega_fine_tune_job_and_launch_test_run_env_vars_template.ini \
-   env_settings/register_omega_fine_tune_job_and_launch_test_run_env_vars.ini   # set PLATFORM_API_KEY
-make register_omega_fine_tune_job_and_launch_test_run
-# repeat the template-copy + make for register_msj_and_launch_test_run
-```
-
-Seeded versions register as `status=draft`; job creation auto-resolves only *published*
-versions. `machine-state-classification` in Dev has an old published version without
-the `fine_tune_checkpoint` port, so the inference/grid scripts pin the seeded draft via
-`MSJ_PIPELINE_VERSION` in `.env` (list drafts with
-`GET /v0.5/batch/registry/pipelines?status=draft`). Drop it once a version with the
-port is published.
+If you ever hit a 404 (e.g. a version was replaced mid-deploy), you can pin an explicit
+version: `MSJ_PIPELINE_VERSION` for inference, `OMEGA_FT_PIPELINE_VERSION` for fine-tune
+(both commented out in `.env.example`). List what your org exposes with
+`GET /v0.5/batch/registry/pipelines?status=published`. If a pipeline is missing
+entirely, it needs (re-)seeding into your org by the platform team.

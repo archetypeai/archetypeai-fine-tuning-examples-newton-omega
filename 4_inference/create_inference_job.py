@@ -166,20 +166,30 @@ def create_job(payload: dict) -> dict:
     return resp.json()
 
 
+def _get_with_retry(url: str, params: dict | None = None, attempts: int = 6) -> dict:
+    # Dev is occasionally flaky (transient 5xx); retry rather than crash the poll loop.
+    last = None
+    for i in range(attempts):
+        try:
+            resp = requests.get(url, headers=AUTH, params=params, timeout=30)
+            if resp.status_code >= 500:
+                last = f"{resp.status_code} {resp.reason}"
+                time.sleep(min(5 * (i + 1), 30))
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            last = str(e)
+            time.sleep(min(5 * (i + 1), 30))
+    raise RuntimeError(f"GET {url} failed after {attempts} attempts: {last}")
+
+
 def get_job(job_id: str) -> dict:
-    resp = requests.get(f"{BASE_URL}/batch/jobs/{job_id}", headers=AUTH)
-    resp.raise_for_status()
-    return resp.json()
+    return _get_with_retry(f"{BASE_URL}/batch/jobs/{job_id}")
 
 
 def list_paginated(job_id: str, kind: str, offset: int) -> dict:
-    resp = requests.get(
-        f"{BASE_URL}/batch/jobs/{job_id}/{kind}",
-        headers=AUTH,
-        params={"offset": offset, "limit": 100},
-    )
-    resp.raise_for_status()
-    return resp.json()
+    return _get_with_retry(f"{BASE_URL}/batch/jobs/{job_id}/{kind}", {"offset": offset, "limit": 100})
 
 
 def watch_job(job_id: str) -> str:
