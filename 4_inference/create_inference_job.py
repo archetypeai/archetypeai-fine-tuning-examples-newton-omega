@@ -34,7 +34,8 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 
 OMEGA_15_BASE_MODEL_PATH = os.environ.get(
     "OMEGA_15_BASE_MODEL_PATH",
-    "s3://atai-platform-dev-platform-data-us-west-2/model_checkpoints/omega_1_5/omega1.5_target_encoder.pt",
+    # Shared marketplace depot — resolves across dev/stage/prod (matches the pipeline default).
+    "s3://atai-marketplace-model-depot/omega/1.5/model.pt",
 )
 
 POLL_INTERVAL_SEC = 5

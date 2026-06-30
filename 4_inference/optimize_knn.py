@@ -44,7 +44,8 @@ FILE_SUFFIX = os.environ.get("FILE_SUFFIX", "")
 MSJ_VERSION = os.environ.get("MSJ_PIPELINE_VERSION")
 OMEGA_15_BASE_MODEL_PATH = os.environ.get(
     "OMEGA_15_BASE_MODEL_PATH",
-    "s3://atai-platform-dev-platform-data-us-west-2/model_checkpoints/omega_1_5/omega1.5_target_encoder.pt",
+    # Shared marketplace depot — resolves across dev/stage/prod (matches the pipeline default).
+    "s3://atai-marketplace-model-depot/omega/1.5/model.pt",
 )
 
 CLASSES = ("normal", "attack")
