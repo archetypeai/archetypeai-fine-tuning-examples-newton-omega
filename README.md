@@ -40,8 +40,10 @@ Fine-tuned head (this example):
 A few clarifications, since the terminology trips people up:
 
 - **KNN is not a model you train.** It has no weights — it just stores labeled example
-  embeddings and classifies by nearest-neighbour vote. Fine-tuning does *not* fine-tune
-  KNN; the trained head *replaces* it.
+  embeddings and classifies by nearest-neighbour vote. (The FT API does offer a
+  `knn` *method*, but it trains nothing: it embeds your labeled files once and stores
+  the vectors as a checkpoint — "fine-tuning" KNN means giving it more reference
+  data, nothing else. The head, by contrast, actually learns.)
 - **The "head" is a small neural network** that maps an Omega embedding to a class
   score. It has its own learnable weights, trained on your labeled data.
 - **The Omega encoder stays frozen in both cases** — its weights never change. Only the
@@ -51,9 +53,10 @@ A few clarifications, since the terminology trips people up:
   distance in the frozen embedding space; a trained head can learn which embedding
   dimensions actually distinguish an attack, expressing boundaries KNN cannot.
 
-This example gives the KNN baseline its best shot (a hyperparameter grid search) and
-compares it head-to-head against the fine-tuned model: **does fine-tuning a head do
-better, on the same data?**
+This example gives the KNN baseline its best shot — a hyperparameter grid search,
+plus (where the `knn` fine-tuning method is deployed) a run with 10× the reference
+vectors from the same files the head trains on — and compares it head-to-head against
+the fine-tuned model: **does fine-tuning a head do better, on the same data?**
 
 ## Pipeline at a glance
 
@@ -69,6 +72,21 @@ better, on the same data?**
 
 State flows between steps through small files in `data/` (`best_knn_config.json`,
 `checkpoint_id.txt`, `*_inference_job_id.txt`).
+
+Steps 5–6 use the `head` fine-tuning method. The API also offers a second method,
+`knn`: no gradient training — the job embeds the *same* labeled train files once and
+stores the vectors as the checkpoint; inference re-fits a KNN from them. Where it is
+deployed (Dev today) you can fine-tune both ways on identical data and compare all
+three runs:
+
+```bash
+python3 3_fine_tune/create_fine_tune_job.py --method knn     # embeds train files → ckp_…
+python3 4_inference/create_inference_job.py --method knn     # classifies eval with that checkpoint
+python3 5_evaluate/evaluate_results.py --compare             # baseline vs KNN vs head
+```
+
+`--compare` reports every run it finds saved in `data/` (inline few-shot baseline,
+fine-tuned KNN, fine-tuned head) with deltas against the baseline.
 
 ## Setup
 
@@ -115,7 +133,7 @@ through. It keeps **40 channels**, dropping 11 constant actuators that never cha
 | `nshot` | 2,000 | few-shot KNN reference (baseline + grid search) |
 | `train` | 20,000 | fine-tune training |
 | `tune` | 2,000 | fine-tune validation + KNN grid-search selection |
-| `eval` | 28,000 | held-out test set, scored once for both models |
+| `eval` | 28,000 | held-out test set, scored once for every run |
 
 Sizes are bounded by SWaT's attack data (~54.6k Attack rows total — the limiting
 resource). **Tune and eval are drawn the same way**, so a KNN config selected on `tune`
@@ -135,21 +153,34 @@ embeddings and the comparison isolates the classifier, not the window.
 
 ## Results
 
-On the held-out `eval` set (balanced, ~54.5k windows), Omega 1.5:
+On the held-out `eval` set (balanced, ~54.5k windows), Omega 1.5, all `seed=0`, all
+three runs on the same day and worker build (KNN config w128/k15/cosine throughout):
 
-| Model | Accuracy | Macro-F1 |
-|---|---|---|
-| Baseline (tuned few-shot KNN, w128/k15/cosine) | 79.7% | 0.796 |
-| **Fine-tuned** (Omega head, default `seed=0`) | **91.9%** | **0.918** |
+| Model | Reference/training data | Accuracy | Macro-F1 |
+|---|---|---|---|
+| Baseline (few-shot KNN, inline) | `nshot` (2k rows/class) | 79.7% | 0.796 |
+| Fine-tuned KNN (stored train vectors) | `train` (20k rows/class) | 82.0% | 0.819 |
+| **Fine-tuned head** | `train` (20k rows/class) | **90.3%** | **0.903** |
 
-**Fine-tuning beats few-shot KNN by ~12 macro-F1 points** on the same Omega embeddings.
-During training the head's validation macro-F1 climbs to ~0.99 (the worker saves a
-checkpoint on each improvement).
+Two comparisons in one table:
+
+- **Head vs the few-shot baseline** (+10.5% accuracy / +0.107 macro-F1): fine-tuning
+  wins decisively.
+- **Head vs KNN on identical data** (+8.3% / +0.084): giving KNN 10× the reference
+  vectors buys only ~2 points — the trained head extracts far more from the same
+  files. (KNN also flatters itself on validation: 0.964 on `tune` vs 0.819 on `eval`,
+  while the head generalizes, 0.984 → 0.903.)
+
+*Where* the head wins is telling. Attack recall is essentially identical across all
+three runs (~88% — every classifier misses the same subtle attacks). The head's
+entire edge is on the normal class (recall 71.9% → 92.5%): **the same detection rate
+with ~3.7× fewer false alarms** (7,659 → 2,055 misclassified normal windows).
 
 ### It's robust across seeds (but not every seed)
 
 Head fine-tuning has run-to-run variance (random weight init, data-shuffle order,
-dropout — all seed-driven). Across a 5-seed sweep, **every seed beat the KNN baseline**:
+dropout — all seed-driven). Across a 5-seed sweep, **every seed beat the few-shot KNN
+baseline** (0.796):
 
 | Seed | Macro-F1 | vs baseline |
 |---|---|---|
@@ -158,6 +189,10 @@ dropout — all seed-driven). Across a 5-seed sweep, **every seed beat the KNN b
 | 1 | 0.913 | +0.117 |
 | 7 | 0.900 | +0.104 |
 | 123 | 0.834 | +0.038 |
+
+(The sweep predates the run in the Results table by a few worker releases — same seed,
+same data, 0.918 then vs 0.903 now — so treat ±0.02 as normal variance across builds
+as well as seeds.)
 
 Most seeds land ~0.90–0.92; a few generalize less well (and one outlier, `seed=42`,
 *underfit* this split at 0.746 — below baseline). So: fine-tuning reliably wins here, but
@@ -179,30 +214,40 @@ bug, not a data or task problem.
 ## How it works
 
 - **Fine-tune** — via the canonical fine-tuning API `POST /v0.6/fine_tuning/jobs`
-  (`model: "omega"`, `method.type: "head"`), the same OpenAI-style service the Console
-  and the Newton example use. It produces an `ftj_…` job (visible on the Fine-Tuning
-  page); the worker windows each labeled CSV, embeds the windows with the frozen Omega
-  1.5 encoder, trains a classification head, and saves it as a `ckp_…` checkpoint.
-  (Under the hood the platform backs `model: "omega"` onto the internal
-  `fine-tuning-omega` pipeline.)
+  (`model: "omega"`), the same OpenAI-style service the Console and the Newton example
+  use. It produces an `ftj_…` job (visible on the Fine-Tuning page) and a `ckp_…`
+  checkpoint. Two methods:
+  - `method.type: "head"` (default) — the worker windows each labeled CSV, embeds the
+    windows with the frozen Omega 1.5 encoder, trains a classification head, and saves
+    it as the checkpoint. (Internal pipeline: `fine-tuning-omega`.)
+  - `method.type: "knn"` — no gradient training: the worker embeds the same labeled
+    training files once and saves the vectors as the checkpoint; inference re-fits a
+    KNN from them. "Fine-tuning" here means growing KNN's reference set from the
+    2k-row n-shot files to the full 20k-row train split. (Internal pipeline:
+    `knn-fine-tuning-omega`; on Dev since 2026-07-15, rolling out to other envs.)
+
+  Both evaluate on the `validation_files` and report `macro_f1`.
 - **Inference** (`pipeline_type: batch`, `pipeline_key: machine-state-classification`):
   classifies each eval window. With no checkpoint it uses few-shot KNN over the
-  `n_shots` reference; attaching the fine-tuned `ckp_…` on the `fine_tune_checkpoint`
-  port swaps in the trained head instead.
+  `n_shots` reference computed inline (legacy path, kept for backward compatibility);
+  attaching a `ckp_…` on the `fine_tune_checkpoint` port swaps in the checkpointed
+  classifier — the trained head or the stored KNN — with window size, data columns,
+  and KNN params taken from the checkpoint's metadata.
 
 ### How the splits map to job inputs
 
 For the committed SWaT splits, the jobs resolve their inputs like this:
 
-- **Fine-tune** — window **128** (the KNN grid winner, reused so both classifiers see
-  identical embeddings), **10 inputs**: 8 `train` files (4 normal + 4 attack) as
-  `training_files`, and 2 `tune` files (1 each) as `validation_files`.
+- **Fine-tune** (either method — `head` and `knn` take identical inputs) — window
+  **128** (the KNN grid winner, reused so all classifiers see identical embeddings),
+  **10 inputs**: 8 `train` files (4 normal + 4 attack) as `training_files`, and 2
+  `tune` files (1 each) as `validation_files`.
 - **Baseline** — KNN at the grid-winning config **w128 / k15 / cosine**, **14 inputs**:
   2 `nshot` files (1 each) on `worker.n_shots` as the few-shot reference, and 12 `eval`
   files (6 each) on `worker.inference` as the held-out set being classified.
-- **Fine-tuned inference** — the same 12 `eval` files, plus the trained checkpoint on
-  `worker.fine_tune_checkpoint` (and the `n_shots` reference, which is ignored once a
-  checkpoint is attached).
+- **Fine-tuned inference** (head or knn checkpoint) — the same 12 `eval` files, plus
+  the checkpoint on `worker.fine_tune_checkpoint` (and the `n_shots` reference, which
+  is ignored once a checkpoint is attached).
 
 (Input counts follow directly from the split sizes and `--rows-per-file`; window 128 is
 whatever the grid picks for the committed data.)
@@ -211,9 +256,10 @@ whatever the grid picks for the committed data.)
 
 The fine-tune produces a **checkpoint** (`ckp_…`). To serve it, run the *same*
 `machine-state-classification` batch job as the baseline and attach the checkpoint on the
-**`worker.fine_tune_checkpoint` input port**. The worker then loads your trained head and
-classifies with it **instead of** building the few-shot KNN — same frozen Omega 1.5
-encoder underneath, different classifier on top. Full request:
+**`worker.fine_tune_checkpoint` input port**. The worker rebuilds the checkpointed
+classifier — the trained head's weights, or a KNN re-fit from the stored vectors — and
+classifies with it **instead of** building the few-shot KNN inline; same frozen Omega
+1.5 encoder underneath, different classifier on top. Full request:
 
 ```json
 POST /v0.5/batch/jobs
