@@ -7,12 +7,15 @@ one class, so every prediction in an output file inherits that file's class. The
 true class is recovered from the output filename (..._output_swat_<class>_4*.csv),
 which is robust for any number of classes.
 
-Pass two job ids to print a baseline-vs-fine-tuned comparison:
-    python 5_evaluate/evaluate_results.py <job_id>
-    python 5_evaluate/evaluate_results.py --compare <baseline_job_id> <finetuned_job_id>
+Usage:
+    python 5_evaluate/evaluate_results.py [job_id]
+    python 5_evaluate/evaluate_results.py --compare [job_id ...]
 
 With no args, scores the job in data/last_inference_job_id.txt. With --compare and
-no ids, reads data/baseline_inference_job_id.txt and data/last_inference_job_id.txt.
+no ids, reports every saved run it finds (needs at least two), deltas vs the first:
+    data/baseline_inference_job_id.txt   baseline (few-shot KNN, inline)
+    data/knn_inference_job_id.txt        fine-tuned KNN (stored train vectors)
+    data/last_inference_job_id.txt       fine-tuned head
 """
 
 import csv
@@ -131,33 +134,38 @@ def main() -> None:
     args = [a for a in args if a != "--compare"]
 
     print("=" * 60)
-    print(" Evaluate Omega Predictions" + (" — baseline vs fine-tuned" if compare else ""))
+    print(" Evaluate Omega Predictions" + (" — comparison" if compare else ""))
     print("=" * 60)
 
     if compare:
-        if len(args) >= 2:
-            baseline_id, finetuned_id = args[0], args[1]
+        if args:
+            runs = [(f"Job {i + 1} ({jid})", jid) for i, jid in enumerate(args)]
         else:
-            baseline_id = read_id("baseline_inference_job_id.txt")
-            finetuned_id = read_id("last_inference_job_id.txt")
-        if not baseline_id or not finetuned_id:
-            print("Need both baseline and fine-tuned job ids (args or saved files).")
+            runs = [(label, read_id(fname)) for label, fname in (
+                ("Baseline (few-shot KNN, inline)", "baseline_inference_job_id.txt"),
+                ("Fine-tuned KNN (train vectors)", "knn_inference_job_id.txt"),
+                ("Fine-tuned head", "last_inference_job_id.txt"),
+            )]
+            runs = [(label, job_id) for label, job_id in runs if job_id]
+        if len(runs) < 2:
+            print("Need at least two runs to compare (pass job ids, or save runs via 4_inference).")
             sys.exit(1)
 
-        print("\n--- BASELINE (few-shot KNN, no fine-tuning) ---")
-        base = score(collect_pairs(baseline_id))
-        print_report(baseline_id, base)
+        scored = []
+        for label, job_id in runs:
+            print(f"\n--- {label} ---")
+            result = score(collect_pairs(job_id))
+            print_report(job_id, result)
+            scored.append((label, result))
 
-        print("\n--- FINE-TUNED (Omega head) ---")
-        fine = score(collect_pairs(finetuned_id))
-        print_report(finetuned_id, fine)
-
-        b = base["correct"] / base["total"] if base["total"] else 0
-        f = fine["correct"] / fine["total"] if fine["total"] else 0
+        ref_label, ref = scored[0]
+        ref_acc = ref["correct"] / ref["total"] if ref["total"] else 0
+        width = max(len(label) for label, _ in scored)
         print("\n" + "=" * 60)
-        print(f"  Baseline accuracy:   {b:.1%}")
-        print(f"  Fine-tuned accuracy: {f:.1%}")
-        print(f"  Delta:               {f - b:+.1%}")
+        for i, (label, res) in enumerate(scored):
+            acc = res["correct"] / res["total"] if res["total"] else 0
+            delta = "" if i == 0 else f"   ({acc - ref_acc:+.1%} vs {ref_label})"
+            print(f"  {label:<{width}} : {acc:.1%}{delta}")
         print("=" * 60)
         return
 

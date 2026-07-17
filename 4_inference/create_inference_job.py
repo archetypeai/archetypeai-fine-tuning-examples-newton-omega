@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """
-Create and monitor a Machine State inference job using the fine-tuned Omega head.
+Create and monitor a Machine State inference job.
 
-Classifies the held-out SWaT files (swat_normal_4.csv, swat_attack_4.csv) with the
-checkpoint produced by 3_fine_tune/create_fine_tune_job.py.
+Classifies the held-out SWaT eval files using a fine-tuning checkpoint produced by
+3_fine_tune/create_fine_tune_job.py — either kind:
+
+    --method head (default)  the trained Omega head (data/checkpoint_id.txt)
+    --method knn             the KNN vectors stored from the train split
+                             (data/knn_checkpoint_id.txt)
+    --baseline               no checkpoint: few-shot KNN computed inline from the
+                             small n-shot reference on worker.n_shots (legacy path,
+                             kept by the platform for backward compatibility)
 
 Usage:
-    python 4_inference/create_inference_job.py [checkpoint_id]
+    python 4_inference/create_inference_job.py [--method head|knn] [checkpoint_id]
+    python 4_inference/create_inference_job.py --baseline
 
-If checkpoint_id is omitted, it is read from data/checkpoint_id.txt.
+If checkpoint_id is omitted, it is read from the method's data/ file above.
 """
 
 import csv
@@ -101,11 +109,15 @@ def load_knn_config() -> dict:
     return {"window_size": 32, "n_neighbors": 11, "metric": "cosine", "weights": "uniform"}
 
 
-def make_payload(checkpoint_id: str | None) -> dict:
-    # Baseline (checkpoint_id is None): few-shot KNN over base Omega 1.5
-    # embeddings, using the grid-search-optimized config. Fine-tuned: attach the
-    # trained head (replaces KNN). Same encoder, same n_shots, same eval set —
-    # only the classifier differs.
+def make_payload(checkpoint_id: str | None, method: str) -> dict:
+    # No checkpoint: few-shot KNN over base Omega 1.5 embeddings, computed inline
+    # from worker.n_shots with the grid-search-optimized config. With a checkpoint
+    # the worker rebuilds the classifier from it — trained head (--method head) or
+    # stored KNN vectors (--method knn) — and takes window_size/data_columns/KNN
+    # params from the checkpoint's metadata, overriding this config. Same encoder,
+    # same eval set throughout — only the classifier differs.
+    # (n_shots stays attached in all modes: the pipeline requires the port; it is
+    # ignored when a checkpoint is present.)
     inputs = {
         "worker.inference": INFERENCE_FILES,
         "worker.n_shots": N_SHOT_FILES,
@@ -115,7 +127,7 @@ def make_payload(checkpoint_id: str | None) -> dict:
             {"kind": "checkpoint", "checkpoint_id": checkpoint_id, "metadata": {}}
         ]
 
-    if checkpoint_id:
+    if checkpoint_id and method == "head":
         # The head fixes the window; KNN params are unused on this path.
         window, knn = finetune_window(), {"n_neighbors": 11, "metric": "cosine", "weights": "uniform"}
     else:
@@ -123,8 +135,12 @@ def make_payload(checkpoint_id: str | None) -> dict:
         window = cfg["window_size"]
         knn = {k: cfg[k] for k in ("n_neighbors", "metric", "weights")}
 
+    if checkpoint_id:
+        name = "swat-machine-state-fine-tuned" if method == "head" else "swat-machine-state-knn"
+    else:
+        name = "swat-machine-state-baseline"
     payload = {
-        "name": "swat-machine-state-fine-tuned" if checkpoint_id else "swat-machine-state-baseline",
+        "name": name,
         "pipeline_type": "batch",
         "pipeline_key": "machine-state-classification",
         "inputs": inputs,
@@ -223,24 +239,40 @@ def watch_job(job_id: str) -> str:
 
 
 def main() -> None:
-    args = [a for a in sys.argv[1:] if a != "--baseline"]
-    baseline = "--baseline" in sys.argv
+    usage = f"Usage: {sys.argv[0]} [--baseline | --method head|knn] [checkpoint_id]"
+    args = sys.argv[1:]
+    baseline = "--baseline" in args
+    args = [a for a in args if a != "--baseline"]
+    method = "head"
+    if "--method" in args:
+        i = args.index("--method")
+        method = args[i + 1] if i + 1 < len(args) else ""
+        del args[i:i + 2]
+    if method not in ("head", "knn") or (baseline and args):
+        raise SystemExit(usage)
 
     checkpoint_id = None
     if not baseline:
+        ckpt_file = "checkpoint_id.txt" if method == "head" else "knn_checkpoint_id.txt"
         if args:
             checkpoint_id = args[0]
         else:
-            ckpt_path = os.path.join(DATA_DIR, "checkpoint_id.txt")
+            ckpt_path = os.path.join(DATA_DIR, ckpt_file)
             if not os.path.exists(ckpt_path):
-                print("No checkpoint id. Run 3_fine_tune/create_fine_tune_job.py first,")
-                print(f"or pass one explicitly: {sys.argv[0]} <checkpoint_id>")
-                print("Or run the no-fine-tuning baseline: {sys.argv[0]} --baseline")
+                ft_cmd = "3_fine_tune/create_fine_tune_job.py" + ("" if method == "head" else " --method knn")
+                print(f"No checkpoint id. Run {ft_cmd} first,")
+                print(f"or pass one explicitly: {sys.argv[0]} --method {method} <checkpoint_id>")
+                print(f"Or run the legacy inline baseline: {sys.argv[0]} --baseline")
                 sys.exit(1)
             with open(ckpt_path) as f:
                 checkpoint_id = f.read().strip()
 
-    mode = "baseline (few-shot KNN)" if baseline else "fine-tuned Omega head"
+    if baseline:
+        mode = "baseline (few-shot KNN, inline)"
+    elif method == "head":
+        mode = "fine-tuned Omega head"
+    else:
+        mode = "fine-tuned KNN (stored train vectors)"
     print("=" * 60)
     print(f" Machine State Inference ({mode})")
     print("=" * 60)
@@ -248,7 +280,7 @@ def main() -> None:
     print(f"  Checkpoint: {checkpoint_id or '(none — base model + KNN)'}")
     print(f"  Inference:  {[f['file_id'] for f in INFERENCE_FILES]}")
 
-    job = create_job(make_payload(checkpoint_id))
+    job = create_job(make_payload(checkpoint_id, method))
     job_id = job["id"]
     print(f"  Job ID:     {job_id}")
     print(f"  Status:     {job['status']}")
@@ -258,12 +290,18 @@ def main() -> None:
     if status != "COMPLETED":
         sys.exit(1)
 
-    filename = "baseline_inference_job_id.txt" if baseline else "last_inference_job_id.txt"
+    if baseline:
+        filename = "baseline_inference_job_id.txt"
+    elif method == "head":
+        filename = "last_inference_job_id.txt"
+    else:
+        filename = "knn_inference_job_id.txt"
     job_id_path = os.path.join(DATA_DIR, filename)
     with open(job_id_path, "w") as f:
         f.write(job_id)
     print(f"Saved job id to {job_id_path}")
     print(f"Next: python 5_evaluate/evaluate_results.py {job_id}")
+    print("  or: python 5_evaluate/evaluate_results.py --compare   (baseline vs fine-tuned)")
 
 
 if __name__ == "__main__":

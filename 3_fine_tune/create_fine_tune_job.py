@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
 """
-Create and monitor an Omega head fine-tuning job via the canonical fine-tuning API.
+Create and monitor an Omega fine-tuning job via the canonical fine-tuning API.
 
-Fine-tunes a classification head on top of the frozen Omega 1.5 encoder using
-labeled SWaT CSV files. Uses the OpenAI-style fine-tuning service (the same one
-the Console uses, and the Newton/"fusion" example uses):
+Uses the OpenAI-style fine-tuning service (the same one the Console uses, and the
+Newton/"fusion" example uses):
 
     POST /v0.6/fine_tuning/jobs            create the job  (model="omega")
     GET  /v0.6/fine_tuning/jobs/{id}       status
     GET  /v0.6/fine_tuning/jobs/{id}/events|checkpoints
 
-This produces an `ftj_...` job and `ckp_...` checkpoints; the platform backs the
-"omega"/"head" method onto the internal `fine-tuning-omega` pipeline. The resulting
-checkpoint id is written to data/checkpoint_id.txt for the inference step.
+Omega supports two fine-tuning methods, selectable with --method:
+
+    head (default)  Train a classification head on top of the frozen Omega 1.5
+                    encoder (labeled train + validation CSVs, gradient descent).
+                    Backed by the internal `fine-tuning-omega` pipeline.
+    knn             No gradient training: embed the same labeled training files
+                    once and store the vectors as a checkpoint. Inference re-fits
+                    a KNN from them. Backed by the internal `knn-fine-tuning-omega`
+                    pipeline.
+
+Both methods consume the same train/validation splits, so the comparison isolates
+the classifier: stored-vector KNN vs a trained head over identical embeddings.
+
+Both produce an `ftj_...` job and a `ckp_...` checkpoint that plugs into the same
+`worker.fine_tune_checkpoint` port of the inference job. The head checkpoint id is
+written to data/checkpoint_id.txt (picked up by 4_inference by default); the knn
+checkpoint id to data/knn_checkpoint_id.txt (picked up by 4_inference --method knn).
 
 Usage:
-    python 3_fine_tune/create_fine_tune_job.py
+    python 3_fine_tune/create_fine_tune_job.py [--method head|knn]
 """
 
 import csv
@@ -57,15 +70,16 @@ TERMINAL = {"SUCCEEDED", "COMPLETED", "FAILED", "CANCELLED", "CANCELED", "STOPPE
 SUCCESS = {"SUCCEEDED", "COMPLETED"}
 
 
-def finetune_window() -> int:
-    """Train at the KNN grid's winning window so the baseline and the head see
-    identical embeddings (controlled comparison). Falls back to 32."""
+def load_knn_config() -> dict:
+    """Grid-search winner, shared with 4_inference. The head trains at its window so
+    baseline and head see identical embeddings; the knn method uses all of it."""
     path = os.path.join(DATA_DIR, "best_knn_config.json")
     if os.path.exists(path):
         with open(path) as f:
-            return int(json.load(f)["window_size"])
-    print("  [note] no best_knn_config.json — run 4_inference/optimize_knn.py first; defaulting window to 32.")
-    return 32
+            return json.load(f)
+    print("  [note] no data/best_knn_config.json — run 4_inference/optimize_knn.py first;"
+          " falling back to w32/k11/cosine.")
+    return {"window_size": 32, "n_neighbors": 11, "metric": "cosine", "weights": "uniform"}
 
 
 def get_data_columns() -> list:
@@ -87,29 +101,51 @@ def omega_files(split: str) -> list:
     return out
 
 
-FINETUNE_WINDOW = finetune_window()
-TRAIN_FILES = omega_files("train")   # labeled training set
-EVAL_FILES = omega_files("tune")     # labeled validation/test set (required for omega)
-
-
-def build_request() -> dict:
-    return {
-        "name": "swat-omega-fine-tune",
-        "seed": SEED,
-        "model": "omega",
-        "method": {
-            "type": "head",
+def build_request(method: str) -> dict:
+    knn_cfg = load_knn_config()
+    window = int(knn_cfg["window_size"])
+    if method == "head":
+        method_spec = {
             "head": {
                 "hyperparameters": {"batch_size": 32, "n_epochs": 30},
                 "reader": {
-                    "window_size": FINETUNE_WINDOW,
+                    "window_size": window,
                     "step_size": 4,
                     "data_columns": get_data_columns(),
                 },
             },
-        },
-        "training_files": TRAIN_FILES,
-        "validation_files": EVAL_FILES,
+        }
+        # Labeled training set + validation/test set (required for omega).
+        train, val = omega_files("train"), omega_files("tune")
+    else:
+        # Same labeled train/val files as the head method — the two fine-tuning
+        # methods differ only in the classifier. Embedded densely (step 1) so KNN
+        # gets its largest possible reference set from the same data.
+        method_spec = {
+            "knn": {
+                "hyperparameters": {
+                    "batch_size": 32,
+                    "n_neighbors": knn_cfg["n_neighbors"],
+                    "metric": knn_cfg["metric"],
+                    "weights": knn_cfg["weights"],
+                    "normalize_embeddings": False,
+                },
+                "reader": {
+                    "window_size": window,
+                    "step_size": 1,
+                    "data_columns": get_data_columns(),
+                },
+            },
+        }
+        train, val = omega_files("train"), omega_files("tune")
+    method_spec["type"] = method
+    return {
+        "name": f"swat-omega-{method}-fine-tune",
+        "seed": SEED,
+        "model": "omega",
+        "method": method_spec,
+        "training_files": train,
+        "validation_files": val,
     }
 
 
@@ -159,16 +195,46 @@ def watch(job_id: str) -> str:
         time.sleep(POLL_INTERVAL_SEC)
 
 
+def parse_method() -> str:
+    args = sys.argv[1:]
+    method = "head"
+    if args:
+        if args[0] == "--method" and len(args) == 2:
+            method = args[1]
+        elif len(args) == 1 and args[0].startswith("--method="):
+            method = args[0].split("=", 1)[1]
+        else:
+            raise SystemExit(f"Usage: {sys.argv[0]} [--method head|knn]")
+    if method not in ("head", "knn"):
+        raise SystemExit(f"Unknown method {method!r}. Usage: {sys.argv[0]} [--method head|knn]")
+    return method
+
+
 def main() -> None:
+    method = parse_method()
+    body = build_request(method)
+    reader = body["method"][method]["reader"]
+
+    title = ("Omega Head Fine-Tune" if method == "head"
+             else "Omega KNN Fine-Tune (stored-vector classifier, no gradient training)")
     print("=" * 60)
-    print(f" Omega Head Fine-Tune via /v0.6/fine_tuning/jobs (SWaT: {', '.join(CLASSES)})")
+    print(f" {title} via /v0.6/fine_tuning/jobs (SWaT: {', '.join(CLASSES)})")
     print("=" * 60)
     print(f"  Endpoint: {FT}/jobs")
-    print(f"  Window:   {FINETUNE_WINDOW} (matched to KNN grid winner) | seed: {SEED}")
-    print(f"  Train:    {[f['file_id'] for f in TRAIN_FILES]}")
-    print(f"  Val:      {[f['file_id'] for f in EVAL_FILES]}")
+    print(f"  Window:   {reader['window_size']} (matched to KNN grid winner) | seed: {SEED}")
+    if method == "knn":
+        hp = body["method"]["knn"]["hyperparameters"]
+        print(f"  KNN:      k={hp['n_neighbors']} {hp['metric']}/{hp['weights']}")
+    print(f"  Train:    {[f['file_id'] for f in body['training_files']]}")
+    print(f"  Val:      {[f['file_id'] for f in body['validation_files']]}")
 
-    job = create_job(build_request())
+    try:
+        job = create_job(body)
+    except requests.HTTPError:
+        if method == "knn":
+            print("Hint: --method knn needs the `knn-fine-tuning-omega` pipeline "
+                  "(on Dev since 2026-07-15; it may not be rolled out to this endpoint yet).")
+        sys.exit(1)
     job_id = job["id"]
     print(f"  Job ID:   {job_id}   (fine_tuned_model resolves on success)")
     print(f"  Status:   {job.get('status')}")
@@ -187,16 +253,21 @@ def main() -> None:
     for c in sorted(checkpoints, key=lambda x: x.get("step", 0)):
         print(f"  - id={c.get('id')} step={c.get('step')} metrics={json.dumps(c.get('metrics'))}")
 
-    # Best = highest step (the worker saves on each validation improvement).
+    # Best = highest step (the head worker saves on each validation improvement;
+    # the knn worker saves a single checkpoint).
     best = max(checkpoints, key=lambda c: c.get("step", 0))
     checkpoint_id = best["id"]
-    with open(os.path.join(DATA_DIR, "checkpoint_id.txt"), "w") as f:
+    ckpt_file = "checkpoint_id.txt" if method == "head" else "knn_checkpoint_id.txt"
+    with open(os.path.join(DATA_DIR, ckpt_file), "w") as f:
         f.write(checkpoint_id)
-    with open(os.path.join(DATA_DIR, "finetune_window.txt"), "w") as f:
-        f.write(str(FINETUNE_WINDOW))
-    print(f"\nSaved checkpoint id: {checkpoint_id} (step {best.get('step')})")
-    print(f"Trained at window {FINETUNE_WINDOW} (saved to data/finetune_window.txt)")
-    print("Next: python 4_inference/create_inference_job.py")
+    print(f"\nSaved checkpoint id: {checkpoint_id} (step {best.get('step')}) to data/{ckpt_file}")
+    if method == "head":
+        with open(os.path.join(DATA_DIR, "finetune_window.txt"), "w") as f:
+            f.write(str(reader["window_size"]))
+        print(f"Trained at window {reader['window_size']} (saved to data/finetune_window.txt)")
+        print("Next: python 4_inference/create_inference_job.py")
+    else:
+        print("Next: python 4_inference/create_inference_job.py --method knn")
 
 
 if __name__ == "__main__":
